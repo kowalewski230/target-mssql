@@ -8,7 +8,6 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
-from time import perf_counter
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import unquote, urlparse
 
@@ -78,37 +77,10 @@ class MSSQLSink(SQLSink[MSSQLConnector]):
         self._staging_prepared = False
 
     @override
-    def setup(self) -> None:
-        """Log total stream setup time, including failed attempts."""
-        start = perf_counter()
-        status = "failed"
-        try:
-            super().setup()
-            status = "completed"
-        finally:
-            self.logger.info(
-                "[TIMING] stream=%s method=setup status=%s elapsed=%.3fs",
-                self.stream_name,
-                status,
-                perf_counter() - start,
-            )
-
-    @override
     def activate_version(self, new_version: int) -> None:
-        """Log version activation time without changing SDK behavior."""
-        start = perf_counter()
-        status = "failed"
-        try:
-            with self.connector.cache_table_columns(self.full_table_name):
-                super().activate_version(new_version)
-            status = "completed"
-        finally:
-            self.logger.info(
-                "[TIMING] stream=%s method=activate_version status=%s elapsed=%.3fs",
-                self.stream_name,
-                status,
-                perf_counter() - start,
-            )
+        """Reuse column metadata during version activation."""
+        with self.connector.cache_table_columns(self.full_table_name):
+            super().activate_version(new_version)
 
     @override
     def get_sink_record_counter(self) -> _WriteOnlyRecordCounter:
