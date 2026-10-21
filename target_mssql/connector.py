@@ -67,6 +67,38 @@ class MSSQLConnector(SQLConnector):
         finally:
             _column_cache_scopes.reset(token)
 
+    def _get_cached_table_columns(
+        self, full_table_name: str | FullyQualifiedName
+    ) -> dict[str, sqlalchemy.Column] | None:
+        """Read the current preparation's snapshot without copying it."""
+        scopes = _column_cache_scopes.get()
+        cache = scopes[-1] if scopes else None
+        if cache is not None and (cache.connector is not self or cache.table != str(full_table_name)):
+            cache = None
+        if cache is None:
+            return None
+        if cache.columns is None:
+            cache.columns = super().get_table_columns(full_table_name)
+        return cache.columns
+
+    @override
+    def column_exists(self, full_table_name: str | FullyQualifiedName, column_name: str) -> bool:
+        """Check cached names without copying any column objects."""
+        columns = self._get_cached_table_columns(full_table_name)
+        if columns is None:
+            return super().column_exists(full_table_name, column_name)
+        return column_name in columns
+
+    @override
+    def _get_column_type(
+        self, full_table_name: str | FullyQualifiedName, column_name: str
+    ) -> sqlalchemy.types.TypeEngine:
+        """Copy only the requested type, which SDK adaptation may mutate."""
+        columns = self._get_cached_table_columns(full_table_name)
+        if columns is None or column_name not in columns:
+            return super()._get_column_type(full_table_name, column_name)
+        return deepcopy(columns[column_name].type)
+
     @override
     def get_table_columns(
         self,
@@ -74,19 +106,14 @@ class MSSQLConnector(SQLConnector):
         column_names: list[str] | None = None,
     ) -> dict[str, sqlalchemy.Column]:
         """Return independent columns from the current scope or fresh reflection."""
-        scopes = _column_cache_scopes.get()
-        cache = scopes[-1] if scopes else None
-        if cache is not None and (cache.connector is not self or cache.table != str(full_table_name)):
-            cache = None
-        if cache is None:
+        columns = self._get_cached_table_columns(full_table_name)
+        if columns is None:
             return super().get_table_columns(full_table_name, column_names)
-        if cache.columns is None:
-            cache.columns = super().get_table_columns(full_table_name)
         selected = {name.casefold() for name in column_names} if column_names else None
         # SDK type adaptation mutates collation; never expose the cached objects.
         return {
             name: deepcopy(column)
-            for name, column in cache.columns.items()
+            for name, column in columns.items()
             if selected is None or name.casefold() in selected
         }
 
