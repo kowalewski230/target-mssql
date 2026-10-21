@@ -77,6 +77,12 @@ class MSSQLSink(SQLSink[MSSQLConnector]):
         self._staging_prepared = False
 
     @override
+    def activate_version(self, new_version: int) -> None:
+        """Reuse column metadata during version activation."""
+        with self.connector.cache_table_columns(self.full_table_name):
+            super().activate_version(new_version)
+
+    @override
     def get_sink_record_counter(self) -> _WriteOnlyRecordCounter:
         """Count `record_count` by rows written rather than rows read.
 
@@ -223,30 +229,32 @@ class MSSQLSink(SQLSink[MSSQLConnector]):
         return f"{self.schema_name}.{staging}" if self.schema_name else staging
 
     def _process_batch_via_blob(self, context: dict) -> None:
-        """Blob-stage path: serialise → upload → OPENROWSET load → delete blob."""
+        """Blob-stage path: serialise -> upload -> OPENROWSET load -> delete blob."""
         from target_mssql.azure_blob import AzureBlobManager
 
         blob_dict = self.config["azure_blob_storage"]
         path_prefix: str = blob_dict.get("path_prefix", "target-mssql")
         blob_name = f"{path_prefix}/{uuid.uuid4()}/data.json"
+        load_method = self.config.get("load_method", "append-only")
         manager = AzureBlobManager.from_config(config=blob_dict, blob_name=blob_name)
 
-        conformed_records = [self.conform_record(r) for r in context["records"]]
+        source_records = context["records"]
+        column_name_map = {}
+        for record in source_records:
+            for key in record:
+                if key not in column_name_map:
+                    column_name_map[key] = self.conform_name(key)
+        self._check_conformed_names_not_duplicated(column_name_map)
+        conformed_records = [
+            {column_name_map[key]: value for key, value in record.items()} for record in source_records
+        ]
         join_keys = [self.conform_name(key, "column") for key in self.key_properties]
         schema = self.conform_schema(self.schema)
 
         if join_keys:
             conformed_records = list({frozenset(r[k] for k in join_keys): r for r in conformed_records}.values())
-
         if not conformed_records:
             return
-
-        self.connector.prepare_table(
-            full_table_name=self.full_table_name,
-            schema=schema,
-            primary_keys=join_keys,
-            as_temp_table=False,
-        )
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as tmp:
             json.dump(conformed_records, tmp, default=str)
@@ -258,7 +266,17 @@ class MSSQLSink(SQLSink[MSSQLConnector]):
 
         with self.connector._engine.connect() as connection:
             try:
-                if join_keys:
+                if load_method == "append-only":
+                    written = self.connector.insert_from_blob(
+                        connection=connection,
+                        full_table_name=self.full_table_name,
+                        schema=schema,
+                        blob_path=blob_name,
+                    )
+                elif load_method == "upsert":
+                    if not join_keys:
+                        msg = f"Upsert requires primary keys for {self.full_table_name}"
+                        raise ValueError(msg)
                     written = self.connector.merge_upsert_from_blob(
                         connection=connection,
                         full_table_name=self.full_table_name,
@@ -267,12 +285,8 @@ class MSSQLSink(SQLSink[MSSQLConnector]):
                         join_keys=join_keys,
                     )
                 else:
-                    written = self.connector.insert_from_blob(
-                        connection=connection,
-                        full_table_name=self.full_table_name,
-                        schema=schema,
-                        blob_path=blob_name,
-                    )
+                    msg = f"Unsupported blob load_method: {load_method}"
+                    raise ValueError(msg)
             finally:
                 manager.delete_blob()
 
@@ -336,13 +350,6 @@ class MSSQLSink(SQLSink[MSSQLConnector]):
         if table.num_rows == 0:
             return
 
-        self.connector.prepare_table(
-            full_table_name=self.full_table_name,
-            schema=schema,
-            primary_keys=join_keys,
-            as_temp_table=False,
-        )
-
         with self._open_native_connection() as conn, conn.cursor() as cursor:
             if join_keys:
                 temp_table_name = arrow_bulkcopy.new_temp_table_name()
@@ -385,14 +392,6 @@ class MSSQLSink(SQLSink[MSSQLConnector]):
             if self.key_properties:
                 deduped_records = list(
                     {frozenset(record[k] for k in self.key_properties): record for record in conformed_records}.values()
-                )
-
-                self.logger.info(f"Preparing table {self.full_table_name}")
-                self.connector.prepare_table(
-                    full_table_name=self.full_table_name,
-                    schema=schema,
-                    primary_keys=join_keys,
-                    as_temp_table=False,
                 )
 
                 staging = self.staging_full_table_name

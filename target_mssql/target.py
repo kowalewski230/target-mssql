@@ -148,6 +148,7 @@ class TargetMSSQL(SQLTarget):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._url: str | None = None
+        self._shared_engine: sqlalchemy.engine.Engine | None = None
 
     def get_url(self, config: Mapping) -> sqlalchemy.engine.url.URL:
         if sqlalchemy_url := config.get("sqlalchemy_url"):
@@ -262,12 +263,16 @@ class TargetMSSQL(SQLTarget):
         if prefix := self.config.get("table_prefix"):
             stream_name = f"{prefix}{stream_name}"
 
+        connector = MSSQLConnector(self.config, sqlalchemy_url=self.url, engine=self._shared_engine)
+        if self._shared_engine is None:
+            self._shared_engine = connector._engine
+
         return MSSQLSink(
             target=self,
             stream_name=stream_name,
             schema=schema,
             key_properties=key_properties,
-            connector=MSSQLConnector(self.config, sqlalchemy_url=self.url),
+            connector=connector,
         )
 
 

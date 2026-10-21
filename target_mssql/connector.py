@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import sys
+from contextlib import contextmanager
+from contextvars import ContextVar
+from copy import deepcopy
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import sqlalchemy
@@ -14,10 +18,28 @@ else:
     from typing_extensions import override
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
 
     from singer_sdk.sql.connector import FullyQualifiedName
     from sqlalchemy.engine import Connection
+
+
+@dataclass(eq=False)
+class _ColumnCache:
+    connector: SQLConnector
+    table: str
+    columns: dict[str, sqlalchemy.Column] | None = None
+
+
+_column_cache_scopes: ContextVar[tuple[_ColumnCache, ...]] = ContextVar("column_cache_scopes", default=())
+
+
+def _invalidate_columns_before_ddl(conn, cursor, statement, parameters, context, executemany):
+    """Invalidate only active snapshots belonging to this engine's execution context."""
+    if context.isddl:
+        for cache in _column_cache_scopes.get():
+            if cache.connector._engine is conn.engine:
+                cache.columns = None
 
 
 class MSSQLConnector(SQLConnector):
@@ -31,6 +53,79 @@ class MSSQLConnector(SQLConnector):
     allow_column_alter: bool = True  # Whether altering column types is supported.
     allow_merge_upsert: bool = True  # Whether MERGE UPSERT is supported.
     allow_temp_tables: bool = True  # Whether temp tables are supported.
+
+    @override
+    def create_engine(self) -> sqlalchemy.engine.Engine:
+        """Attach one DDL listener for the lifetime of the shared engine."""
+        engine = super().create_engine()
+        sqlalchemy.event.listen(engine, "before_cursor_execute", _invalidate_columns_before_ddl)
+        return engine
+
+    @contextmanager
+    def cache_table_columns(self, full_table_name: str | FullyQualifiedName) -> Iterator[None]:
+        """Reuse columns for one operation, refreshing after DDL and clearing on exit."""
+        cache = _ColumnCache(self, str(full_table_name))
+        token = _column_cache_scopes.set((*_column_cache_scopes.get(), cache))
+        try:
+            yield
+        finally:
+            _column_cache_scopes.reset(token)
+
+    @override
+    def prepare_table(self, full_table_name: str | FullyQualifiedName, *args: Any, **kwargs: Any) -> None:
+        """Reuse reflected columns only within this preparation, until DDL runs."""
+        with self.cache_table_columns(full_table_name):
+            return super().prepare_table(full_table_name, *args, **kwargs)
+
+    def _get_cached_table_columns(
+        self, full_table_name: str | FullyQualifiedName
+    ) -> dict[str, sqlalchemy.Column] | None:
+        """Read the current preparation's snapshot without copying it."""
+        scopes = _column_cache_scopes.get()
+        cache = scopes[-1] if scopes else None
+        if cache is not None and (cache.connector is not self or cache.table != str(full_table_name)):
+            cache = None
+        if cache is None:
+            return None
+        if cache.columns is None:
+            cache.columns = super().get_table_columns(full_table_name)
+        return cache.columns
+
+    @override
+    def column_exists(self, full_table_name: str | FullyQualifiedName, column_name: str) -> bool:
+        """Check cached names without copying any column objects."""
+        columns = self._get_cached_table_columns(full_table_name)
+        if columns is None:
+            return super().column_exists(full_table_name, column_name)
+        return column_name in columns
+
+    @override
+    def _get_column_type(
+        self, full_table_name: str | FullyQualifiedName, column_name: str
+    ) -> sqlalchemy.types.TypeEngine:
+        """Copy only the requested type, which SDK adaptation may mutate."""
+        columns = self._get_cached_table_columns(full_table_name)
+        if columns is None or column_name not in columns:
+            return super()._get_column_type(full_table_name, column_name)
+        return deepcopy(columns[column_name].type)
+
+    @override
+    def get_table_columns(
+        self,
+        full_table_name: str | FullyQualifiedName,
+        column_names: list[str] | None = None,
+    ) -> dict[str, sqlalchemy.Column]:
+        """Return independent columns from the current scope or fresh reflection."""
+        columns = self._get_cached_table_columns(full_table_name)
+        if columns is None:
+            return super().get_table_columns(full_table_name, column_names)
+        selected = {name.casefold() for name in column_names} if column_names else None
+        # SDK type adaptation mutates collation; never expose the cached objects.
+        return {
+            name: deepcopy(column)
+            for name, column in columns.items()
+            if selected is None or name.casefold() in selected
+        }
 
     @override
     def create_schema(self, schema_name: str):
@@ -234,8 +329,10 @@ class MSSQLConnector(SQLConnector):
     _CREDENTIAL_NAME = "target_mssql_credential"
     _DATA_SOURCE_NAME = "target_mssql_stage"
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, engine: sqlalchemy.engine.Engine | None = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        if engine is not None:
+            self._cached_engine = engine
         self._stage_prepared = False
 
     def _openjson_type(self, property_jsonschema: dict) -> str:
@@ -260,13 +357,35 @@ class MSSQLConnector(SQLConnector):
             return "BIT"
         return "NVARCHAR(MAX)"
 
-    def _openjson_with_clause(self, schema: dict) -> str:
-        """Build the WITH (…) column list for OPENJSON."""
+    def _openjson_with_clause(
+        self,
+        schema: dict,
+        join_keys: list[str] | None = None,
+    ) -> str:
+        """Build the WITH (…) column list for OPENJSON.
+
+        For string MERGE keys use the same VARCHAR(255) type as the
+        destination primary key, avoiding implicit conversion on the
+        indexed target column when joining against OPENJSON data.
+        """
         quote = self._dialect.identifier_preparer.quote
-        return ",\n            ".join(
-            f"{quote(col)} {self._openjson_type(jsonschema)} '$.{col}'"
-            for col, jsonschema in schema["properties"].items()
-        )
+        keys = set(join_keys or [])
+        columns = []
+
+        for col, jsonschema in schema["properties"].items():
+            sql_type = self._openjson_type(jsonschema)
+
+            # Mirror create_empty_table's primary key type adjustment.
+            if (
+                col in keys
+                and self._jsonschema_type_check(jsonschema, ("string",))
+                and isinstance(self.to_sql_type(jsonschema), sqlalchemy.types.VARCHAR)
+            ):
+                sql_type = "VARCHAR(255)"
+
+            columns.append(f"{quote(col)} {sql_type} '$.{col}'")
+
+        return ",\n            ".join(columns)
 
     def insert_from_blob(
         self,
@@ -318,7 +437,7 @@ class MSSQLConnector(SQLConnector):
         quote = self._dialect.identifier_preparer.quote
         properties = schema["properties"]
         col_names = list(properties.keys())
-        with_clause = self._openjson_with_clause(schema)
+        with_clause = self._openjson_with_clause(schema, join_keys)
         ds = self._DATA_SOURCE_NAME
 
         join_condition = " AND ".join(f"_target.{quote(k)} = _src.{quote(k)}" for k in join_keys)
