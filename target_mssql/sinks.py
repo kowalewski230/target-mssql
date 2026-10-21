@@ -99,7 +99,8 @@ class MSSQLSink(SQLSink[MSSQLConnector]):
         start = perf_counter()
         status = "failed"
         try:
-            super().activate_version(new_version)
+            with self.connector.cache_table_columns(self.full_table_name):
+                super().activate_version(new_version)
             status = "completed"
         finally:
             self.logger.info(

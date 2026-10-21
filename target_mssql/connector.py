@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
@@ -17,7 +18,7 @@ else:
     from typing_extensions import override
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
 
     from singer_sdk.sql.connector import FullyQualifiedName
     from sqlalchemy.engine import Connection
@@ -33,6 +34,14 @@ class _ColumnCache:
 _column_cache_scopes: ContextVar[tuple[_ColumnCache, ...]] = ContextVar("column_cache_scopes", default=())
 
 
+def _invalidate_columns_before_ddl(conn, cursor, statement, parameters, context, executemany):
+    """Invalidate only active snapshots belonging to this engine's execution context."""
+    if context.isddl:
+        for cache in _column_cache_scopes.get():
+            if cache.connector._engine is conn.engine:
+                cache.columns = None
+
+
 class MSSQLConnector(SQLConnector):
     """The connector for mssql.
 
@@ -46,26 +55,27 @@ class MSSQLConnector(SQLConnector):
     allow_temp_tables: bool = True  # Whether temp tables are supported.
 
     @override
-    def prepare_table(self, full_table_name: str | FullyQualifiedName, *args: Any, **kwargs: Any) -> None:
-        """Reuse reflected columns only within this preparation, until DDL runs."""
+    def create_engine(self) -> sqlalchemy.engine.Engine:
+        """Attach one DDL listener for the lifetime of the shared engine."""
+        engine = super().create_engine()
+        sqlalchemy.event.listen(engine, "before_cursor_execute", _invalidate_columns_before_ddl)
+        return engine
+
+    @contextmanager
+    def cache_table_columns(self, full_table_name: str | FullyQualifiedName) -> Iterator[None]:
+        """Reuse columns for one operation, refreshing after DDL and clearing on exit."""
         cache = _ColumnCache(self, str(full_table_name))
         token = _column_cache_scopes.set((*_column_cache_scopes.get(), cache))
-
-        def invalidate_before_ddl(conn, cursor, statement, parameters, context, executemany):
-            # Invalidate enclosing scopes too: nested preparation can change their table.
-            # Other execution contexts on the same engine retain their own snapshots.
-            if context.isddl and cache in _column_cache_scopes.get():
-                cache.columns = None
-
         try:
-            engine = self._engine
-            sqlalchemy.event.listen(engine, "before_cursor_execute", invalidate_before_ddl)
-            try:
-                return super().prepare_table(full_table_name, *args, **kwargs)
-            finally:
-                sqlalchemy.event.remove(engine, "before_cursor_execute", invalidate_before_ddl)
+            yield
         finally:
             _column_cache_scopes.reset(token)
+
+    @override
+    def prepare_table(self, full_table_name: str | FullyQualifiedName, *args: Any, **kwargs: Any) -> None:
+        """Reuse reflected columns only within this preparation, until DDL runs."""
+        with self.cache_table_columns(full_table_name):
+            return super().prepare_table(full_table_name, *args, **kwargs)
 
     def _get_cached_table_columns(
         self, full_table_name: str | FullyQualifiedName
@@ -319,8 +329,10 @@ class MSSQLConnector(SQLConnector):
     _CREDENTIAL_NAME = "target_mssql_credential"
     _DATA_SOURCE_NAME = "target_mssql_stage"
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, engine: sqlalchemy.engine.Engine | None = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        if engine is not None:
+            self._cached_engine = engine
         self._stage_prepared = False
 
     def _openjson_type(self, property_jsonschema: dict) -> str:
